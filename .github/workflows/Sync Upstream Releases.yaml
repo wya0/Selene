@@ -21,7 +21,7 @@ jobs:
   sync-releases:
     runs-on: ubuntu-latest
     env:
-      UPSTREAM_OWNER: XWF8188
+      UPSTREAM_OWNER: MoonTechLab
       UPSTREAM_REPO: Selene
       PER_PAGE: "100"
     steps:
