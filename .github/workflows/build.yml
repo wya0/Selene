@@ -17,36 +17,35 @@ permissions:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
-          # Android
           - name: android
             os: ubuntu-latest
             build-args: "--android-only"
 
-          # macOS / iOS
           - name: macos_ios
             os: macos-latest
-            build-args: "--apple-only"
-            
-          # Windows
+            build-args: "--apple-only --sequential"
+
           - name: windows-amd64
             os: windows-latest
-    
+
     runs-on: ${{ matrix.os }}
     env:
       NDK_VERSION: '29.0.14033849'
       NDK_VERSION_DEPS: '27.0.12077973'
+
     name: Build ${{ matrix.name }}
     outputs:
       version: ${{ steps.get_version.outputs.version }}
-    
+
     steps:
       - name: Clone repository
         run: |
           git clone https://${{ secrets.PULL_TOKEN }}@${{ secrets.REPO_URL }}.git .
         shell: bash
-      
+
       - name: Get version from pubspec.yaml
         id: get_version
         run: |
@@ -59,11 +58,19 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Extracted version: $VERSION"
         shell: bash
-      
+
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
+          flutter-version: '3.44.0'
+          channel: stable
           cache: true
+
+      - name: Disable Swift Package Manager for Apple builds
+        if: matrix.name == 'macos_ios'
+        run: |
+          flutter config --no-enable-swift-package-manager
+        shell: bash
 
       - name: Install Java
         if: matrix.name == 'android'
@@ -103,7 +110,7 @@ jobs:
         run: |
           echo "y" | sdkmanager --install "ndk;${{ env.NDK_VERSION }}"
           echo "y" | sdkmanager --install "ndk;${{ env.NDK_VERSION_DEPS }}"
-          
+
       - name: Write sign info
         if: matrix.name == 'android'
         run: |
@@ -117,7 +124,6 @@ jobs:
           storeFile=${{ github.workspace }}/key.jks
           EOF
             echo "Signing configuration written successfully"
-            cat android/key.properties
           else
             echo "WARNING: SIGNING_KEY secret is not set!"
           fi
@@ -125,32 +131,48 @@ jobs:
 
       - name: Build with build.sh (Android/macOS/iOS)
         if: matrix.name != 'windows-amd64'
-        continue-on-error: true
         run: |
           chmod +x build.sh
           ./build.sh ${{ matrix.build-args }}
         shell: bash
-      
+
       - name: Build on Windows
         if: matrix.name == 'windows-amd64'
-        continue-on-error: true
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $version = "${{ steps.get_version.outputs.version }}"
           Write-Host "Building version: $version" -ForegroundColor Green
+
           flutter pub get
+
           New-Item -ItemType Directory -Force -Path dist | Out-Null
+
           Write-Host "Building Windows..." -ForegroundColor Blue
           flutter build windows --release
-          Compress-Archive -Path build/windows/x64/runner/Release/* -DestinationPath "dist/selene-$version-windows-x64-portable.zip" -Force
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
+          $releasePath = "build/windows/x64/runner/Release"
+          if (-not (Test-Path $releasePath)) {
+            throw "Windows release directory not found: $releasePath"
+          }
+
+          Compress-Archive `
+            -Path "$releasePath/*" `
+            -DestinationPath "dist/selene-$version-windows-x64-portable.zip" `
+            -Force
+
           Write-Host "Windows build complete" -ForegroundColor Green
-      
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
-        continue-on-error: true
         with:
           name: ${{ matrix.name }}-release-artifacts
           path: dist/*
+          if-no-files-found: error
 
   create-release:
     needs: build
@@ -159,27 +181,34 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/')
     env:
       TZ: Asia/Shanghai
+
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: all-artifacts
-      
+
       - name: Prepare release artifacts
         run: |
           mkdir -p release-files
           find all-artifacts -type f -exec cp {} release-files/ \;
+
+          if [ -z "$(find release-files -type f -print -quit)" ]; then
+            echo "No release artifacts found"
+            exit 1
+          fi
+
           ls -lh release-files/
-      
+
       - name: Get version from tag
         id: tag_version
         run: |
           VERSION="${GITHUB_REF#refs/tags/}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Release version: $VERSION"
-      
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
@@ -188,132 +217,30 @@ jobs:
           files: release-files/*
           draft: false
           prerelease: false
-          fail_on_unmatched_files: false
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
+
       - name: Get Release Notes
         id: release_notes
         run: |
           RELEASE_INFO=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.tag_version.outputs.version }}")
-          
+
           RELEASE_BODY=$(echo "$RELEASE_INFO" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data.get('body', '') if 'body' in data else '')")
-          
+
           {
             echo 'notes<<EOF'
             echo "$RELEASE_BODY"
             echo EOF
           } >> $GITHUB_OUTPUT
-          
+
           echo "Release notes length: ${#RELEASE_BODY}"
-      
-      - name: Send Telegram notification
-        if: success()
-        env:
-          CHANNEL_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-        run: |
-          if [ ! -d "release-files" ] || [ -z "$(ls -A release-files)" ]; then
-            echo "No release files found"
-            exit 0
-          fi
-          
-          VERSION="${{ steps.tag_version.outputs.version }}"
-          RELEASE_URL="https://github.com/${{ github.repository }}/releases/tag/${VERSION}"
-          TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-          
-          RELEASE_NOTES=$(cat << 'NOTES_EOF'
-          ${{ steps.release_notes.outputs.notes }}
-          NOTES_EOF
-          )
-          
-          echo "开始上传文件到 Telegram..."
-          
-          FILE_IDS=()
-          MESSAGE_IDS=()
-          for file in release-files/*; do
-            if [ -f "$file" ]; then
-              filename=$(basename "$file")
-              
-              if [[ ! "$filename" =~ \.(apk|ipa)$ ]]; then
-                echo "跳过文件: $filename"
-                continue
-              fi
-              
-              RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendDocument" \
-                -F "chat_id=${CHANNEL_ID}" \
-                -F "document=@${file}")
-              
-              FILE_ID=$(echo "$RESPONSE" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['result']['document']['file_id'] if 'result' in data else '')" 2>/dev/null)
-              MESSAGE_ID=$(echo "$RESPONSE" | python3 -c "import sys, json; data=json.load(sys.stdin); print(data['result']['message_id'] if 'result' in data else '')" 2>/dev/null)
-              
-              if [ ! -z "$FILE_ID" ]; then
-                FILE_IDS+=("$FILE_ID")
-                MESSAGE_IDS+=("$MESSAGE_ID")
-              fi
-              
-              sleep 1
-            fi
-          done
-          
-          if [ ${#FILE_IDS[@]} -gt 0 ]; then
-            echo "准备发送 media group..."
-            FILE_IDS_JSON=$(printf '%s\n' "${FILE_IDS[@]}" | jq -R . | jq -s .) 
-            export FILE_IDS_JSON VERSION RELEASE_URL TIMESTAMP RELEASE_NOTES
-            
-            python3 << 'PYEOF' > media.json
-          import json
-          import os
-          
-          file_ids = json.loads(os.environ['FILE_IDS_JSON'])
-          version = os.environ['VERSION']
-          release_url = os.environ['RELEASE_URL']
-          timestamp = os.environ['TIMESTAMP']
-          release_notes = os.environ.get('RELEASE_NOTES', '').strip()
-          
-          message = f"""🎉 *Selene 新版本发布*"""
-          
-          if release_notes:
-              if len(release_notes) > 800:
-                  release_notes = release_notes[:800] + "..."
-              message += f"\n\n📝 *更新说明*:\n{release_notes}"
-          
-          message += f"""
-          
-          📦 版本: `{version}`
-          🔗 GitHub: [点击查看]({release_url})
-          💡 Windows 及 MacOS 包请自行前往 Releases 处下载
-          🕐 发布于: {timestamp}"""
-          
-          media = []
-          for idx, file_id in enumerate(file_ids):
-              item = {
-                  "type": "document",
-                  "media": file_id
-              }
-              if idx == len(file_ids) - 1:
-                  item["caption"] = message
-                  item["parse_mode"] = "Markdown"
-              media.append(item)
-          
-          print(json.dumps(media))
-          PYEOF
-            
-            curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMediaGroup" \
-              -H "Content-Type: application/json" \
-              -d "{\"chat_id\":\"${CHANNEL_ID}\",\"media\":$(cat media.json)}"
-            
-            for msg_id in "${MESSAGE_IDS[@]}"; do
-              curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage" \
-                -d "chat_id=${CHANNEL_ID}" \
-                -d "message_id=${msg_id}" > /dev/null
-            done
-          fi
-        
+
   cleanup:
     runs-on: ubuntu-latest
     needs: build
+    if: always()
     steps:
       - name: Delete workflow runs
         uses: Mattraks/delete-workflow-runs@main
